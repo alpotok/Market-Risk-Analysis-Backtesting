@@ -1,0 +1,580 @@
+---
+title: "Estymacja i backtesting miar ryzyka rynkowego dla kursu PLN/NOK"
+author: "Aleksander Potok"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: hide
+---
+
+# Wstęp
+
+Analiza została wykonana na dziennych notowaniach kursu walutowego pary PLN/NOK (polski złoty do korony norweskiej). Notowania pochodzą z okresu  04.01.2016 - 10.10.2025 i stanowią próbę ponad 2500 obserwacji. Dane pobrałem ze strony https://stooq.pl. Celem projektu jest wyznaczenie różnymi metodami Value at Risk (VaR) i Expected Shortfall (ES) oraz zweryfikowanie jakości uzyskanych wyników za pomocą testów wstecznych.
+
+
+```{r message=F}
+library(ggplot2)
+library(tidyverse)
+library(moments)
+library(knitr)
+library(patchwork)
+library(rugarch)
+
+plnnok_d <- read.csv("plnnok_d.csv")
+plnnok_d$Data <- as.Date(plnnok_d$Data)
+u = log(plnnok_d[2:2527,5]/plnnok_d[1:2526,5]) * 100
+```
+
+Na początku przyjrzymy się wykresowi dziennych notowań oraz logarytmicznych stóp zwrotu.
+
+```{r}
+ggplot()+
+  geom_line(aes(x=plnnok_d$Data, y=plnnok_d$Zamkniecie), col="grey") +
+  labs(
+    x = "Data",
+    y = "Wartość",
+    title = "Wykres dziennych notowań PLN/NOK"
+  ) +
+  theme_bw()
+```
+
+```{r}
+ggplot() +
+  geom_line(aes(x = plnnok_d$Data[2:2527], y=u), col="grey") +
+  labs(
+    x = "Data",
+    y = "%", 
+    title = "Dzienne logarytmiczne stopy zwrotu w %"
+  ) +
+  theme_bw()
+```
+
+W latach 2016-2020 widzimy umiarkowaną tendencję wzrostową kursu. W marcu 2020 roku, po wybuchu pandemii, nastąpił gwałtowny skok notowań, po którym miała miejsce dwuletnia korekta spadkowa. Ostatnie 3 lata to powrót do wyraźnego trendu wzrostowego. Na wykresie logarytmicznych stóp zwrotu najbardziej wyróżnia się efekt pandemii oraz wojny na Ukrainie.
+
+Spójrzmy na statystyki opisowe.
+
+```{r}
+stat_opisowe <- data.frame(
+  "Średnia" = mean(u),
+  "Odch. stand." = sd(u),
+  "Wsp. skośności" = skewness(u),
+  "Kurtoza" = moments::kurtosis(u),
+  "Min" = min(u),
+  "Q1" = quantile(u)[2],
+  "Mediana" = median(u),
+  "Q3" = quantile(u)[4],
+  "Max" = max(u),
+  row.names = "Wartość"
+)
+
+kable(t(round(stat_opisowe,4)))
+```
+
+Statystyki opisowe są typowe dla logarytmicznych stóp zwrotu. Średnia i mediana są bliskie zera. Odchylenie standardowe jest niewielkie, natomiast kurtoza wynosi 9,84. Oznacza to występowanie "grubych ogonów" - w praktyce ekstremalne stopy zwrotu występują częściej niż przy założeniu o rozkładzie normalnym. 
+
+# Value at Risk
+
+Przechodzimy teraz do wyznaczania Value at Risk. We wszystkich przypadkach będziemy wyznaczać VaR i ES 99% na 250-dniowym oknie.
+
+## Metoda historyczna
+
+Pierwszą analizowaną metodą będzie metoda historyczna, która bazuje na empirycznych stratach portfela z ostatnich 250 dni.
+
+```{r warning = FALSE}
+straty <- -u 
+metoda_historyczna <- function(dane)
+{
+  n = length(dane)
+  VaR <- c()
+  ES <- c()
+  
+  for(i in 251:n)
+  {
+    okno <- dane[(i-250):(i-1)]
+    VaR[i] <- quantile(okno, 0.99)
+    if(VaR[i]<0){
+      VaR[i]=0
+    } 
+    ES[i] <- mean(okno[okno>VaR[i]])
+  }
+  return(list(VaR=VaR, ES=ES))
+}
+
+df_metoda_historyczna <- data.frame(
+  Data = plnnok_d$Data[2:2527],
+  straty = straty,
+  VaR_hist = metoda_historyczna(straty)$VaR,
+  ES_hist = metoda_historyczna(straty)$ES
+)
+
+p_h <- ggplot(data = df_metoda_historyczna, aes(x = Data)) +
+  geom_line(aes(y=straty), color = "grey") +
+  geom_line(aes(y=VaR_hist, colour = "VaR")) +
+  geom_line(aes(y=ES_hist, colour = "ES")) +
+  scale_color_viridis_d() +
+  labs(
+    title = "VaR i ES - metoda historyczna",
+    y = "Wartość"
+  ) +
+  theme_bw()
+p_h
+```
+
+VaR oszacowany metodą historyczną przybiera postać funkcji schodkowej. Na wykresie widać to najlepiej w 2020 roku, kiedy wysoki skok tuż po wybuchu pandemii "utrzymuje się w pamięci" modelu przez cały rok.
+
+## Metoda historyczna z wagami
+
+```{r warning=F}
+metoda_historyczna_wagi <- function(dane)
+{
+  n = length(dane)
+  VaR <- c()
+  ES <- c()
+  i <- 1:250
+  q <- 0.995
+  
+  wagi <- (q^(250-i) * (1-q))/ (1 - q^250)
+  
+  for(j in 251:n)
+  {
+    okno <- dane[(j-250):(j-1)]
+    
+    df_okno <- data.frame(
+      strata = okno,
+      waga = wagi
+    ) |>
+      arrange(strata) |>
+      mutate(skum_wagi = cumsum(waga))
+    
+    idx_var <- which(df_okno$skum_wagi >= 0.99)
+    
+    VaR[j] <- df_okno$strata[idx_var[1]]
+    if(VaR[j]<0){
+      VaR[j]=0
+    } 
+
+    ES[j] <- sum(df_okno$strata[idx_var] * df_okno$waga[idx_var]) / sum(df_okno$waga[idx_var])
+  }
+  return(list(df_okno = df_okno, VaR=VaR, ES=ES))
+}
+
+df_metoda_historyczna_wagi <- data.frame(
+  Data = plnnok_d$Data[2:2527],
+  straty = straty,
+  VaR_wagi = metoda_historyczna_wagi(straty)$VaR,
+  ES_wagi = metoda_historyczna_wagi(straty)$ES
+)
+
+p_w <- ggplot(data = df_metoda_historyczna_wagi, aes(x = Data)) +
+  geom_line(aes(y=straty), color = "grey") +
+  geom_line(aes(y=VaR_wagi, colour = "VaR")) +
+  geom_line(aes(y=ES_wagi, colour = "ES")) +
+  scale_color_viridis_d() +
+  labs(
+    title = "VaR i ES - metoda historyczna z wagami",
+    y = "Wartość"
+  ) +
+  theme_bw()
+
+p_w
+```
+
+Metoda historyczna z wagami jest rozszerzeniem poprzedniej metody. Wagi dla starszych obserwacji są niższe, przez co po dużych skokach jak w 2020 roku, wartość VaR-u szybciej się stabilizuje. Krzywa nadal ma postać funkcji schodkowej, jednak stopnie są zdecydowanie krótsze. Parametr `q`, wpływający na "szybkość zapominania", przyjąłem równy 0,995.
+
+## Metody parametryczne 
+
+Kolejne rozszerzenie oferują metody parametryczne. Odrzucają one założenie o stałości wariancji w czasie.
+
+### EWMA
+
+```{r warning = FALSE}
+straty <- -u 
+
+EWMA <- function(dane, lambda=0.94){
+  n = length(dane)
+  EWMA <- rep(NA, n)
+  EWMA[1] <- var(dane[1:30])
+  for (i in 2:n){
+    EWMA[i] <- lambda * EWMA[i-1] + (1 - lambda) * dane[i-1]^2
+  }
+  zm_EWMA <- sqrt(EWMA)
+  return(zm_EWMA)
+}
+
+metoda_parametryczna_EWMA <- function(dane)
+{
+  n = length(dane)
+  VaR <- c()
+  ES <- c()
+  zm <- EWMA(dane)
+
+  for(i in 251:n)
+  {
+    okno <- dane[(i-250):(i-1)]
+    zm_n1 <- zm[i]
+    okno <- okno * zm_n1 / zm[(i-250):(i-1)]
+    VaR[i] <- quantile(okno, 0.99)
+    if(VaR[i]<0){
+      VaR[i]=0
+    } 
+    ES[i] <- mean(okno[okno>VaR[i]])
+  }
+  return(list(VaR=VaR, ES=ES))
+}
+
+df_metoda_parametryczna_EWMA <- data.frame(
+  Data = plnnok_d$Data[2:2527],
+  straty = straty,
+  VaR_EWMA = metoda_parametryczna_EWMA(straty)$VaR,
+  ES_EWMA = metoda_parametryczna_EWMA(straty)$ES
+)
+
+p_e <- ggplot(data = df_metoda_parametryczna_EWMA, aes(x = Data)) +
+  geom_line(aes(y=straty), color = "grey") +
+  geom_line(aes(y=VaR_EWMA, colour = "VaR")) +
+  geom_line(aes(y=ES_EWMA, colour = "ES")) +
+  scale_color_viridis_d() +
+  labs(
+    title = "VaR i ES - metoda EWMA",
+    y = "Wartość"
+  ) +
+  theme_bw()
+p_e
+```
+
+### GARCH(1,1)
+
+```{r warning = FALSE}
+straty <- -u 
+
+GARCH <- function(dane){
+  n = length(dane)
+  garch_spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = FALSE) 
+  )
+  garch_fit <- ugarchfit(spec = garch_spec, data = dane)
+  zm_GARCH <- sigma(garch_fit)
+  return(as.vector(zm_GARCH))
+}
+
+metoda_parametryczna_GARCH <- function(dane)
+{
+  n = length(dane)
+  VaR <- c()
+  ES <- c()
+  zm <- GARCH(dane)
+
+  for(i in 251:n)
+  {
+    okno <- dane[(i-250):(i-1)]
+    zm_n1 <- zm[i]
+    okno <- okno * zm_n1 / zm[(i-250):(i-1)]
+    VaR[i] <- quantile(okno, 0.99)
+    if(VaR[i]<0){
+      VaR[i]=0
+    } 
+    ES[i] <- mean(okno[okno>VaR[i]])
+  }
+  return(list(VaR=VaR, ES=ES))
+}
+
+df_metoda_parametryczna_GARCH <- data.frame(
+  Data = plnnok_d$Data[2:2527],
+  straty = straty,
+  VaR_G = metoda_parametryczna_GARCH(straty)$VaR,
+  ES_G = metoda_parametryczna_GARCH(straty)$ES
+)
+
+p_g <- ggplot(data = df_metoda_parametryczna_GARCH, aes(x = Data)) +
+  geom_line(aes(y=straty), color = "grey") +
+  geom_line(aes(y=VaR_G, colour = "VaR")) +
+  geom_line(aes(y=ES_G, colour = "ES")) +
+  scale_color_viridis_d() +
+  labs(
+    title = "VaR i ES - metoda GARCH(1,1)",
+    y = "Wartość"
+  ) +
+  theme_bw()
+p_g
+```
+
+Obie metody dają zbliżone wyniki. Przede wszystkim metody te szybko reagują na gwałtowne zmiany i wskazują zdecydowanie wyższy VaR niż metody historyczne. Dla skoku po wybuchu pandemii metody EWMA i GARCH(1,1) szacują VaR na poziomie odpowiednio 5,14 i 4,59 - prawie dwa razy wyżej niż poprzednie metody.
+
+## Metoda Monte Carlo
+
+```{r warning=F}
+metoda_monte_carlo <- function(dane)
+{
+  n = length(dane)
+  VaR <- c()
+  ES <- c()
+  
+  for(i in 251:n)
+  {
+    okno <- dane[(i-250):(i-1)]
+    symulacja <- rnorm(10000, mean(okno), sd(okno))
+    VaR[i] <- quantile(symulacja, 0.99)
+    if(VaR[i]<0){
+      VaR[i]=0
+    } 
+    ES[i] <- mean(symulacja[symulacja > VaR[i]])
+  }
+  return(list(VaR=VaR, ES=ES))
+}
+
+df_metoda_monte_carlo <- data.frame(
+  Data = plnnok_d$Data[2:2527],
+  straty = straty,
+  VaR_MC = metoda_monte_carlo(straty)$VaR,
+  ES_MC = metoda_monte_carlo(straty)$ES
+)
+
+p_mc <- ggplot(data = df_metoda_monte_carlo, aes(x = Data)) +
+  geom_line(aes(y=straty), color = "grey") +
+  geom_line(aes(y=VaR_MC, colour = "VaR")) +
+  geom_line(aes(y=ES_MC, colour = "ES")) +
+  scale_color_viridis_d() +
+  labs(
+    title = "VaR i ES - metoda Monte Carlo",
+    y = "Wartość"
+  ) +
+  theme_bw()
+p_mc
+```
+
+Metoda Monte Carlo padła ofiarą załozenia o normalności stóp zwrotu. W okresach większej zmienności, tuż po wybuchu pandemii czy wojny w Ukrainie, model reaguje z dużym opóźnieniem na wysokie straty.
+
+## Porównanie
+
+```{r warning=F}
+empty <- ggplot() + theme_void()
+(p_h + p_w) / (p_e + p_g) / (p_mc + empty)
+```
+
+# Testy wsteczne
+
+Zajmiemy się weryfikacją uzyskanych wyników za pomocą testów wstecznych. Łączymy wyniki w jeden data frame i zliczamy wyjątki w oknie 250 obserwacji.
+
+```{r}
+df <- df_metoda_historyczna |>
+  select(Data, Strata = straty, VaR_hist) |>
+  inner_join(df_metoda_historyczna_wagi |> select(Data, VaR_wagi), by = "Data") |>
+  inner_join(df_metoda_parametryczna_EWMA |> select(Data, VaR_EWMA), by = "Data") |>
+  inner_join(df_metoda_parametryczna_GARCH |> select(Data, VaR_G), by = "Data") |>
+  inner_join(df_metoda_monte_carlo |> select(Data, VaR_MC), by = "Data") |>
+  na.omit()
+```
+
+```{r}
+zliczenie_wyjatkow <- function(straty, VaR, T=250){
+  wyjatki <- c()
+  n <- length(straty)
+  for(i in (T+1):n){
+    okno = straty[(i-T):(i-1)]
+    wyjatki[i] <- sum(okno > VaR[i])
+  }
+  return(wyjatki)
+}
+
+wyjatki_wagi <- zliczenie_wyjatkow(df$Strata, df$VaR_wagi)
+wyjatki_EWMA <- zliczenie_wyjatkow(df$Strata, df$VaR_EWMA)
+wyjatki_GARCH <- zliczenie_wyjatkow(df$Strata, df$VaR_G)
+wyjatki_MC <- zliczenie_wyjatkow(df$Strata, df$VaR_MC)
+```
+
+
+## Rozkład liczby wyjątków
+
+```{r warning=F}
+p1 <- ggplot(data.frame(x = wyjatki_wagi), aes(x)) +
+  geom_histogram(
+    bins = length(unique(wyjatki_wagi)),
+    fill = "grey", color = "black") +
+  labs(title = "Metoda historyczna z wagami", x = "Liczba wyjątków", y = "Częstość") +
+  theme_bw()
+
+p2 <- ggplot(data.frame(x = wyjatki_EWMA), aes(x)) +
+  geom_histogram(
+    bins = length(unique(wyjatki_EWMA)),
+    fill = "grey", color = "black") +
+  labs(title = "Metoda EWMA", x = "Liczba wyjątków", y = "Częstość") +
+  theme_bw()
+
+p3 <- ggplot(data.frame(x = wyjatki_MC), aes(x)) +
+  geom_histogram(
+    bins = length(unique(wyjatki_MC)),
+    fill = "grey", color = "black") +
+  labs(title = "Metoda Monte Carlo", x = "Liczba wyjątków", y = "Częstość") +
+  theme_bw()
+
+p4 <- ggplot(data.frame(x = wyjatki_GARCH), aes(x)) +
+  geom_histogram(
+    bins = length(unique(wyjatki_GARCH)),
+    fill = "grey", color = "black") +
+  labs(title = "Metoda parametryczna - GARCH(1,1)", x = "Liczba wyjątków", y = "Częstość") +
+  theme_bw()
+
+(p1 + p3) / (p2 + p4)
+```
+
+Uzyskane histogramy mocno się różnią. Metoda historyczna z wagami dała bardzo bezpieczne wyniki - ani razu nie mieliśmy więcej niż 5 wyjątków w oknie. W metodzie Monte Carlo liczba wyjątków w oknie jest nieznacznie większa. Wyniki różnia się mocno dla metod parametrycznych. Średnia liczba wyjątków nosi około 4,5 a największa liczba wyjątków w oknie wyniosła dla metod EWMA i GARCH(1,1) odpowiednio 28 i 27. Sprawdzimy teraz te wyniki za pomocą testu Bernoulliego, które oparty jest na rozkładzie dwumianowym.
+
+## Test Bernoulliego
+
+Dla okien o długości 250 oraz 100 obserwacji sprawdzamy za pomocą rokzkładu dwumianowego czy liczba wyjątków "wynosi ok. 1%". Następnie liczymy odsetek przypadków, w których odrzuciliśmy hipotezę zerową, czyli gdy liczba wyjątków jest zbyt duża (lub teoretycznie zbyt mała). W literaturze i w publikacjach dostępnych w internecie dominującym podejściem jest liczenie p-value na całym zbiorze danych ze względu na większą moc testu. Również uwzględnimy to podejście, a także sprawdzimy jak zachowywała się liczba wyjątków w zależności od metody w okresie spokojnym (lata 2017-2019), a jak w latach burzliwych (2020-2022).
+
+```{r}
+rozk_bernoulliego <- function(zliczone_wyjatki, T=250, p = 0.01){
+  pvalue = 1 - pbinom(q = zliczone_wyjatki - 1, size = T, prob = p)
+  pvalue = na.omit(pvalue)
+  return(pvalue)
+}
+```
+
+```{r}
+wyniki_testy_wsteczne <- function(straty, VaR, daty, metoda){
+  wyjatki <- sum(straty > VaR)
+  pvalue <- 1 - pbinom(q = wyjatki-1, size = length(straty), prob = 0.01)
+  
+  idx_spokojne <- (daty >= "2017-01-01" & daty <= "2019-12-31")
+  wyjatki_spokojne <- sum(straty[idx_spokojne] > VaR[idx_spokojne])
+  pvalue_spokojne <- 1 - pbinom(q = wyjatki_spokojne-1, size = sum(idx_spokojne), prob = 0.01)
+  
+  idx_burzliwe <- (daty >= "2020-01-01" & daty <= "2022-12-31")
+  wyjatki_burzliwe <- sum(straty[idx_burzliwe] > VaR[idx_burzliwe])
+  pvalue_burzliwe <- 1 - pbinom(q = wyjatki_burzliwe-1, size = sum(idx_burzliwe), prob = 0.01)
+  
+  wyjatki_250 <- zliczenie_wyjatkow(straty, VaR, T = 250)
+  pvalue_250  <- rozk_bernoulliego(wyjatki_250, T = 250)
+  odsetek_250 <- mean(pvalue_250 < 0.05, na.rm = TRUE)
+  
+  wyjatki_100 <- zliczenie_wyjatkow(straty, VaR, T = 100)
+  pvalue_100  <- rozk_bernoulliego(wyjatki_100, T = 100)
+  odsetek_100 <- mean(pvalue_100 < 0.05, na.rm = TRUE)
+  
+  return(data.frame(
+    Metoda = metoda,
+    `Odrzucenia 250` = odsetek_250,
+    `Odrzucenia 100` = odsetek_100,
+    `pvalue (całość)` = pvalue,
+    `pvalue (spokojbe)` = pvalue_spokojne,
+    `pvalue (burzliwe)` = pvalue_burzliwe
+  ))
+}
+
+set.seed(321)
+wyniki_b <- rbind(
+  wyniki_testy_wsteczne(df$Strata, df$VaR_hist, df$Data, "Historyczna"),
+  wyniki_testy_wsteczne(df$Strata, df$VaR_wagi, df$Data, "Wagi"),
+  wyniki_testy_wsteczne(df$Strata, df$VaR_EWMA, df$Data, "EWMA"),
+    wyniki_testy_wsteczne(df$Strata, df$VaR_G, df$Data, "Garch"),
+  wyniki_testy_wsteczne(df$Strata, df$VaR_MC, df$Data, "Monte Carlo")
+  ) 
+
+colnames(wyniki_b) <- c("Metoda", "Odsetek odrzuceń dla okna 250", "Odsetek odrzuceń dla okna 100", "p-value (całość)", "p-value (spokojne)", "p-value (burzliwe)")
+kable(wyniki_b, digits = 4)
+```
+
+Wyniki różnią się pomiędzy metodami. W okresach 250 i 100 dni dla metody historycznej i historycznej z wagami liczba wyjątków w oknie zawsze była "w normie". Modele parametryczne EWMA i GARCH charakteryzują się najwyższym odsetkiem odrzuceń, szczególnie dla okna 250 obserwacji. W oknie o długości 100 odsetek odrzuceń drastycznie spada - stabilność jest większa. Gdy spojrzymy, czy liczba wyjątków jest w normie dla całego zbioru danych, otrzymujemy, że wszystkie metody przeszły test pomyślnie (pvalue > 0,05). Najbezpieczniejszym modelem okazała się metoda z wagami, natomiast najsłabsza metoda Monte Carlo, która systematycznie niedoszacowywała ryzyka (p-value zaledwie 0,08). Analizując okres spokojny (lata 2017-2019) wszystkie metody osiągnęły wysokie pvalue. W okresie burzliwym (2020-2022) najlepiej poradziła sobie metoda parametryczna EWMA, a najgorzej metoda Monte Carlo, która osiągnęła pvalue 0,09.
+
+## Test Christoffersena
+
+Oprócz liczby wyjątków ważnym zjawiskiem jest ich niezależność. Odpowiedź na to dają testy niezależności m.in. test Christoffersena:
+
+$H_0:$ przekroczenia VaR są niezależne w czasie
+
+$H_1:$ przekroczenia VaR nie są niezależne w czasie
+
+```{r}
+christoffersen <- function(straty, VaR, daty, T=250){
+  if(T!=0){
+    n = length(straty)
+    wyniki <- rep(NA, n)
+    for(i in (T+1):n){
+      okno <- straty[(i-T):(i-1)]
+      okno_VaR <- VaR[(i-T):(i-1)]
+      wyjatki_bool <- ifelse(okno > okno_VaR, 1, 0)
+      u00 <- sum(lag(wyjatki_bool)== 0 & wyjatki_bool == 0, na.rm = T)
+      u10 <- sum(lag(wyjatki_bool)== 1 & wyjatki_bool == 0, na.rm = T)
+      u01 <- sum(lag(wyjatki_bool)== 0 & wyjatki_bool == 1, na.rm = T)
+      u11 <- sum(lag(wyjatki_bool)== 1 & wyjatki_bool == 1, na.rm = T)
+    
+      if((u00 + u01 > 0) && (u10 + u11 > 0) && (u00 + u01 + u10 + u11 > 0)) {
+        pi <- (u01 + u11)/(u00 + u01 + u10 + u11) 
+        pi01 <- u01 / (u00 + u01)
+        pi11 <- u11 / (u10 + u11)
+    
+        z <- -2*log((1-pi)^(u00 + u10)*pi^(u01 + u11)) + 2*log((1-pi01)^u00 * pi01^u01*(1-pi11)^u10*pi11^u11)
+        wyniki[i] <- ifelse(z>qchisq(p=0.95, df=1), 1, 0) #1 jeśli 
+      }
+      else{wyniki[i]=0}
+    }
+  }
+  
+  
+  else{
+    wyjatki_bool <- ifelse(straty > VaR, 1, 0)
+    u00 <- sum(lag(wyjatki_bool)== 0 & wyjatki_bool == 0, na.rm = TRUE)
+    u10 <- sum(lag(wyjatki_bool)== 1 & wyjatki_bool == 0, na.rm = TRUE)
+    u01 <- sum(lag(wyjatki_bool)== 0 & wyjatki_bool == 1, na.rm = TRUE)
+    u11 <- sum(lag(wyjatki_bool)== 1 & wyjatki_bool == 1, na.rm = TRUE)
+    
+    if((u00 + u01 > 0) && (u10 + u11 > 0) && (u00 + u01 + u10 + u11 > 0)) {
+      pi <- (u01 + u11)/(u00 + u01 + u10 + u11) 
+      pi01 <- u01 / (u00 + u01)
+      pi11 <- u11 / (u10 + u11)
+    
+      z <- -2*log((1-pi)^(u00 + u10)*pi^(u01 + u11)) + 2*log((1-pi01)^u00 * pi01^u01*(1-pi11)^u10*pi11^u11)
+      wyniki <- 1 - pchisq(z, df=1)
+    }
+    else{wyniki=1}
+  }
+  return(wyniki)
+}
+```
+
+```{r}
+wyniki_testy_niezaleznosci <- function(straty, VaR, daty, metoda){
+  pvalue <- christoffersen(straty, VaR, daty, T=0)
+  odsetek_250 <- mean(christoffersen(straty, VaR, daty, T=250), na.rm = TRUE)
+  odsetek_100 <- mean(christoffersen(straty, VaR, daty, T=100), na.rm = TRUE)
+  
+  idx_spokojne <- (daty >= "2017-01-01" & daty <= "2019-12-31")
+  pvalue_spokojne <- christoffersen(straty[idx_spokojne], VaR[idx_spokojne], daty[idx_spokojne], T=0)
+  
+  idx_burzliwe <- (daty >= "2020-01-01" & daty <= "2022-12-31")
+  pvalue_burzliwe <- christoffersen(straty[idx_burzliwe], VaR[idx_burzliwe], daty[idx_burzliwe], T=0)
+
+  return(data.frame(
+    Metoda = metoda,
+    `Odrzucenia 250` = odsetek_250,
+    `Odrzucenia 100` = odsetek_100, 
+    `pvalue (całość)` = pvalue,
+    `pvalue (spokojbe)` = pvalue_spokojne,
+    `pvalue (burzliwe)` = pvalue_burzliwe
+  ))
+}
+set.seed(321)
+wyniki_c <- rbind(
+  wyniki_testy_niezaleznosci(df$Strata, df$VaR_hist, df$Data, "Historyczna"),
+  wyniki_testy_niezaleznosci(df$Strata, df$VaR_wagi, df$Data, "Wagi"),
+  wyniki_testy_niezaleznosci(df$Strata, df$VaR_EWMA, df$Data, "EWMA"),
+  wyniki_testy_niezaleznosci(df$Strata, df$VaR_G, df$Data, "Garch"),
+  wyniki_testy_niezaleznosci(df$Strata, df$VaR_MC, df$Data, "Monte Carlo")
+  ) 
+
+colnames(wyniki_c) <- c("Metoda", "Odsetek odrzuceń dla okna 250", "Odsetek odrzuceń dla okna 100","p-value (całość)",  "p-value (spokojne)", "p-value (burzliwe)")
+kable(wyniki_c, digits = 4)
+```
+
+
+Dla testu niezależności Christoffersena wyniki również różnią się między metodami. Analizując odsetek odrzuceń w oknach 250 i 100 obserwacji, metody parametryczne wypadają zdecydowanie najlepiej, osiągając wynik równy 0. Najgorzej wypada metoda Monte Carlo. W tym miejscu pada ona ofiarą założenia o normalności rozkładu - w przypadku dużego skoku predykcja VaR jest zbyt optymistyczna, przez co przekroczenia występują klastrowo. Badając p-value w całym okresie danych dla metody Monte Carlo wynosi ono zaledwie 0,0005. W okresie spokojnym wszystkie metody radzą sobie dobrze, jednak w latach 2020-2022, gdy nastąpiły największe skoki metoda Monte Carlo i historyczna poległy, natomiast parametryczne zareagowały szybko na zwiększoną zmienność.
+
+# Podsumowanie
+
+Projekt pozwolił na przeanalizowanie pięciu metod liczenia Value at Risk oraz dwóch testów wstecznych - jednego dystrybucyjnego i jednego niezależności. Nie jest możliwe ocenienie, która z metod jest obiektywnie najlepsza. Metoda historyczna oraz historyczna z wagami dawały najbezpiecznejsze wyniki - liczba przekroczeń zawsze była "w normie". Metody parametryczne dobrze radziły sobie z testem niezależności, poprzez szybkie reagowanie na różnicę w zmienności. Metoda Monte Carlo dała najsłabsze wyniki, ale jest to konsekwencja założenia o rozkładzie normalnym stóp zwrotu.
