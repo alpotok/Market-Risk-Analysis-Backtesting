@@ -1,6 +1,6 @@
 # Market Risk Analysis & Backtesting for PLN/NOK
 
-**Date:** 2024-05-22  
+**Date:** 2025-11-30  
 
 This repository contains a comprehensive analysis of market risk measures for the **PLN/NOK** (Polish Zloty to Norwegian Krone) exchange rate. The project focuses on the estimation and backtesting of **Value at Risk (VaR)** and **Expected Shortfall (ES)** using various statistical and econometric approaches.
 
